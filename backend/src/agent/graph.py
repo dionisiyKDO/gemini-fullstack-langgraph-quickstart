@@ -1,51 +1,40 @@
 import os
 
-from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
 
+from langchain_groq import ChatGroq
+
+from agent.configuration import Configuration
+from agent.utils import get_research_topic
+from agent.retrieval import Retrieval
+from agent.tools_and_schemas import (
+    SearchQueryList, 
+    DocumentAnswer,
+)
 from agent.state import (
     OverallState,
     QueryGenerationState,
-    ReflectionState,
-    WebSearchState,
+    RetrievalState,
 )
-from agent.configuration import Configuration
 from agent.prompts import (
     get_current_date,
     query_writer_instructions,
-    web_searcher_instructions,
-    reflection_instructions,
     answer_instructions,
-)
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
-from agent.utils import (
-    get_citations,
-    get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
 )
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
-    
 if os.getenv("GROQ_API_KEY") is None:
     raise ValueError("GROQ_API_KEY is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
-
 
 # Nodes
-def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
+def generate_queries(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
     Uses Groq (Llama 3.3) to create an optimized search queries for web research based on
@@ -56,7 +45,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         config: Configuration for the runnable, including LLM provider settings
 
     Returns:
-        Dictionary with state update, including search_query key containing the generated queries
+        Dictionary with state update, including search_queries
     """
     configurable = Configuration.from_runnable_config(config)
 
@@ -67,7 +56,7 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     # init Groq LLM
     llm = ChatGroq(
         model=configurable.query_generator_model,
-        temperature=1.0, # better 0?
+        temperature=0.7,
         max_retries=2,
         api_key=os.getenv("GROQ_API_KEY"),
     )
@@ -82,216 +71,138 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     )
     # Generate the search queries
     result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
+    return {"search_queries": result.queries}
 
 
-def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
-
-    This is used to spawn n number of web research nodes, one for each search query.
+def fan_out_retrieval(state: QueryGenerationState):
+    """LangGraph node that sends the search queries to the retrieve_chunks node.
+    
+    This is used to spawn n number of retrieve_chunks nodes, one for each search query.
     """
     return [
-        Send("web_research", {"search_query": search_query, "id": int(idx)})
-        for idx, search_query in enumerate(state["search_query"])
+        Send("retrieve_chunks", {"query": query, "query_id": idx})
+        for idx, query in enumerate(state["search_queries"])
     ]
 
 
-def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
-
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
-
+def retrieve_chunks(state: RetrievalState, config: RunnableConfig) -> OverallState:
+    """Retrieve top-k relevant chunks using BM25.
+    
     Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
-
+        state: Contains single query to search for
+        config: Contains file path and top_k settings
+        
     Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
+        Updated state with retrieved chunks and source files
     """
-    # Configure
     configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
-
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.search_model, 
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
-
+    
+    retrieval = Retrieval()
+    retrieved, source_files = retrieval.search(state["query"], top_k=configurable.top_k_chunks)
+    
+    # print(f"[Query {state['query_id']}] '{state['query_id']}' → {len(retrieved)} chunks from {len(source_files)} files")
+    
     return {
-        "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "retrieved_chunks": retrieved,
+        "source_files": list(source_files),
     }
 
 
-def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
-    """LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
-
-    Analyzes the current summary to identify areas for further research and generates
-    potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
-
+def generate_answer(state: OverallState, config: RunnableConfig) -> OverallState:
+    """LangGraph node that synthesizes final answer from all retrieved chunks.
+    
     Args:
-        state: Current graph state containing the running summary and research topic
-        config: Configuration for the runnable, including LLM provider settings
-
+        state: Contains all retrieved chunks from all queries
+        config: Contains LLM model selection and max tokens limit
+        
     Returns:
-        Dictionary with state update, including search_query key containing the generated follow-up query
+        Final answer and citation list
     """
     configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
-    state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model", configurable.reflection_model)
-
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
+    
+    # Deduplicate chunks by header_id
+    seen_chunks = {}
+    for chunk in state["retrieved_chunks"]:
+        key = chunk["header_id"]
+        if key not in seen_chunks or chunk["relevance_score"] > seen_chunks[key]["relevance_score"]:
+            seen_chunks[key] = chunk
+    
+    sorted_chunks = sorted(
+        seen_chunks.values(),
+        key=lambda c: c["relevance_score"],
+        reverse=True
     )
-    # init Reasoning Model
+    
+    # Build context with rough token estimate
+    context_parts = []
+    total_tokens = 0
+    max_tokens = configurable.max_tokens
+    
+    for i, chunk in enumerate(sorted_chunks):
+        chunk_text = f"\n\n--- SOURCE [{i+1}]: {chunk['header_id']} ---\n{chunk['content']}"
+        chunk_tokens = len(chunk_text.split()) * 1.3  # Rough estimate (1 word = 1.3 tokens)
+        
+        if total_tokens + chunk_tokens > max_tokens:
+            break
+        
+        context_parts.append(chunk_text)
+        total_tokens += chunk_tokens
+    
+    context = "".join(context_parts)
+    
+    # Generate answer with citations
     llm = ChatGroq(
-        model=reasoning_model,
-        temperature=1.0, # better 0?
+        model=configurable.answer_model,
+        temperature=0,  # Deterministic for factual answers
         max_retries=2,
         api_key=os.getenv("GROQ_API_KEY"),
     )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
-
-    return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
-    }
-
-
-def evaluate_research(
-    state: ReflectionState,
-    config: RunnableConfig,
-) -> OverallState:
-    """LangGraph routing function that determines the next step in the research flow.
-
-    Controls the research loop by deciding whether to continue gathering information
-    or to finalize the summary based on the configured maximum number of research loops.
-
-    Args:
-        state: Current graph state containing the research loop count
-        config: Configuration for the runnable, including max_research_loops setting
-
-    Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
-    """
-    configurable = Configuration.from_runnable_config(config)
-    max_research_loops = (
-        state.get("max_research_loops")
-        if state.get("max_research_loops") is not None
-        else configurable.max_research_loops
-    )
-    if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
-        return "finalize_answer"
-    else:
-        return [
-            Send(
-                "web_research",
-                {
-                    "search_query": follow_up_query,
-                    "id": state["number_of_ran_queries"] + int(idx),
-                },
-            )
-            for idx, follow_up_query in enumerate(state["follow_up_queries"])
-        ]
-
-
-def finalize_answer(state: OverallState, config: RunnableConfig):
-    """LangGraph node that finalizes the research summary.
-
-    Prepares the final output by deduplicating and formatting sources, then
-    combining them with the running summary to create a well-structured
-    research report with proper citations.
-
-    Args:
-        state: Current graph state containing the running summary and sources gathered
-
-    Returns:
-        Dictionary with state update, including running_summary key containing the formatted final summary with sources
-    """
-    configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
-
-    # Format the prompt
+    
+    structured_llm = llm.with_structured_output(DocumentAnswer)
+    
     current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
+    research_topic = get_research_topic(state["messages"])
+    
+    prompt = answer_instructions.format(
         current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
+        research_topic=research_topic,
+        context=context,
     )
-
-    # init Reasoning Model (Groq)
-    llm = ChatGroq(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GROQ_API_KEY"),
-    )
-    result = llm.invoke(formatted_prompt)
-
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
-    unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
-
-    return {
-        "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
-    }
-
+    
+    try:
+        result = structured_llm.invoke(prompt)
+        
+        # Format final answer with sources
+        final_answer = result.answer
+        if result.citations:
+            final_answer += "\n\n**Sources:**\n"
+            for i, citation in enumerate(result.citations, 1):
+                final_answer += f"{i}. {citation}\n"
+        
+        return {
+            "messages": [AIMessage(content=final_answer)],
+            "final_answer": final_answer,
+        }
+        
+    except Exception as e:
+        error_msg = f"Error generating answer: {e}\n\nFound relevant info in: {state['source_files']}"
+        return {
+            "messages": [AIMessage(content=error_msg)],
+            "final_answer": error_msg,
+        }
 
 # Create our Agent Graph
 builder = StateGraph(OverallState, config_schema=Configuration)
 
 # Define the nodes we will cycle between
-builder.add_node("generate_query", generate_query)
-builder.add_node("web_research", web_research)
-builder.add_node("reflection", reflection)
-builder.add_node("finalize_answer", finalize_answer)
+builder.add_node("generate_queries", generate_queries)
+builder.add_node("retrieve_chunks", retrieve_chunks)
+builder.add_node("generate_answer", generate_answer)
 
-# Set the entrypoint as `generate_query`
-# This means that this node is the first one called
-builder.add_edge(START, "generate_query")
-# Add conditional edge to continue with search queries in a parallel branch
-builder.add_conditional_edges(
-    "generate_query", continue_to_web_research, ["web_research"]
-)
-# Reflect on the web research
-builder.add_edge("web_research", "reflection")
-# Evaluate the research
-builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
-)
-# Finalize the answer
-builder.add_edge("finalize_answer", END)
+# Define flow
+builder.add_edge(START, "generate_queries")
+builder.add_conditional_edges("generate_queries", fan_out_retrieval, ["retrieve_chunks"])
+builder.add_edge("retrieve_chunks", "generate_answer")
+builder.add_edge("generate_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+graph = builder.compile(name="local-doc-search-agent")

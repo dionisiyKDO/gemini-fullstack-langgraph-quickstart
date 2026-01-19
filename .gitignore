@@ -1,3 +1,6 @@
+# Data folder
+langgraph_old_docs/
+
 # Node / Frontend
 node_modules/
 frontend/dist/
