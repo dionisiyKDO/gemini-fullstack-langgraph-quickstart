@@ -5,6 +5,7 @@ from rank_bm25 import BM25Okapi
 from agent.utils import get_all_file_paths, read_file_content, split_markdown_by_headers
 from agent.state import DocumentChunkState
 
+# Singleton Retrieval class for retrieving document chunks
 class Retrieval:
     _instance = None
     
@@ -22,7 +23,6 @@ class Retrieval:
         if self.initialized:
             return # Retrieval already initialized, skipping reload
 
-        # print(f"--- Loading documents from: {directory} ---")
         file_paths = get_all_file_paths(directory)
         
         self.chunks: List[DocumentChunkState] = []
@@ -53,10 +53,8 @@ class Retrieval:
         if not self.chunks:
             raise Exception("No document chunks found in the specified directory.")
 
-        # print(f"Building BM25 index for {len(self.chunks)} chunks...")
         self.bm25 = BM25Okapi(tokenized_corpus)
         self.initialized = True
-        # print("--- Indexing Complete ---")
 
     def search(self, query: str, top_k: int = 5):
         """Query the pre-built index."""

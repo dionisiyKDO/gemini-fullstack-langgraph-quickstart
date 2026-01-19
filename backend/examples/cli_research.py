@@ -51,13 +51,6 @@ def main() -> None:
     )
     
     
-    # Debug options
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print detailed execution info",
-    )
-    
     args = parser.parse_args()
     
     # Validate directory
@@ -65,6 +58,7 @@ def main() -> None:
         print(f"Error: Directory '{args.dir}' does not exist")
         return
     
+    # Initialize Retrieval singletong and load files from local directory
     engine = Retrieval()
     engine.load_data(args.dir)
     
@@ -84,14 +78,6 @@ def main() -> None:
         }
     }
     
-    if args.verbose:
-        print(f"\n{'='*60}")
-        print(f"Searching in: {args.dir}")
-        print(f"Question: {args.question}")
-        print(f"Queries to generate: {args.num_queries}")
-        print(f"Chunks per query: {args.top_k}")
-        print(f"{'='*60}\n")
-    
     # Run the graph
     result = graph.invoke(state, config=config)
     
@@ -105,14 +91,6 @@ def main() -> None:
         print()
     else:
         print("No answer generated. Check your documents and query.")
-    
-    if args.verbose:
-        print("\n" + "="*60)
-        print("DEBUG INFO:")
-        print("="*60)
-        print(f"Queries generated: {result.get('search_queries', [])}")
-        print(f"Chunks retrieved: {len(result.get('retrieved_chunks', []))}")
-        print(f"Source files: {result.get('source_files', [])}")
 
 
 if __name__ == "__main__":

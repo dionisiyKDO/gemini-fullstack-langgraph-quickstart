@@ -100,8 +100,6 @@ def retrieve_chunks(state: RetrievalState, config: RunnableConfig) -> OverallSta
     retrieval = Retrieval()
     retrieved, source_files = retrieval.search(state["query"], top_k=configurable.top_k_chunks)
     
-    # print(f"[Query {state['query_id']}] '{state['query_id']}' → {len(retrieved)} chunks from {len(source_files)} files")
-    
     return {
         "retrieved_chunks": retrieved,
         "source_files": list(source_files),
