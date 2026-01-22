@@ -3,21 +3,23 @@ from pydantic import BaseModel, Field
 
 
 class SearchQueryList(BaseModel):
-    query: List[str] = Field(
-        description="A list of search queries to be used for web research."
+    """Multiple search queries to cover different aspects of the question."""
+    queries: List[str] = Field(
+        description="List of search queries to retrieve relevant documentation chunks."
     )
     rationale: str = Field(
-        description="A brief explanation of why these queries are relevant to the research topic."
+        description="Brief explanation of the search strategy."
     )
 
 
-class Reflection(BaseModel):
-    is_sufficient: bool = Field(
-        description="Whether the provided summaries are sufficient to answer the user's question."
+class DocumentAnswer(BaseModel):
+    """Structured answer with citations to source documents. This is what the final LLM call produces."""
+    answer: str = Field(
+        description="Complete answer to the user's question, with inline citations like [1], [2]."
     )
-    knowledge_gap: str = Field(
-        description="A description of what information is missing or needs clarification."
+    citations: List[str] = Field(
+        description="List of file paths referenced in the answer, in order of citation number."
     )
-    follow_up_queries: List[str] = Field(
-        description="A list of follow-up queries to address the knowledge gap."
+    confidence: str = Field(
+        description="'high' if docs fully answer question, 'medium' if partial, 'low' if minimal info found."
     )
